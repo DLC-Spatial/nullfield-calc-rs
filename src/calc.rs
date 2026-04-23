@@ -88,6 +88,63 @@ pub struct MiscloseResult {
 }
 
 /// Compute traverse misclose from (bearing_dms, distance) legs at 256-bit precision.
+fn dms_to_dd(dms: f64) -> f64 {
+    let sign = if dms < 0.0 { -1.0 } else { 1.0 };
+    let dms = dms.abs();
+    let d = dms.trunc();
+    let frac = (dms - d) * 100.0;
+    let m = frac.trunc();
+    let s = (frac - m) * 100.0;
+    sign * (d + m / 60.0 + s / 3600.0)
+}
+
+pub struct DeflectionCheck {
+    pub sum_deg: f64,
+    pub error_deg: f64,
+}
+
+pub fn check_deflection_sum(legs: &[(f64, f64)]) -> Option<DeflectionCheck> {
+    if legs.len() < 3 {
+        return None;
+    }
+    let bearings: Vec<f64> = legs.iter().map(|&(b, _)| dms_to_dd(b)).collect();
+    let n = bearings.len();
+    let sum: f64 = (0..n)
+        .map(|i| {
+            let b_in = bearings[i];
+            let b_out = bearings[(i + 1) % n];
+            ((b_out - b_in - 180.0).rem_euclid(360.0)) - 180.0
+        })
+        .sum();
+    let error_deg = sum.abs() - 360.0;
+    Some(DeflectionCheck { sum_deg: sum, error_deg })
+}
+
+const BLUNDER_IMPROVEMENT_FACTOR: f64 = 3.0;
+
+pub struct BlunderCandidate {
+    pub leg_index: usize,
+    pub ratio_without: f64,
+}
+
+pub fn detect_blunders(legs: &[(f64, f64)], current_ratio: f64) -> Vec<BlunderCandidate> {
+    if legs.len() < 4 {
+        return vec![];
+    }
+    let mut candidates: Vec<BlunderCandidate> = (0..legs.len())
+        .filter_map(|i| {
+            let reduced: Vec<_> = legs[..i].iter().chain(legs[i + 1..].iter()).copied().collect();
+            let ratio_without = calculate_misclose(&reduced)?.ratio;
+            if ratio_without.is_finite() && ratio_without < current_ratio * BLUNDER_IMPROVEMENT_FACTOR {
+                return None;
+            }
+            Some(BlunderCandidate { leg_index: i, ratio_without })
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.ratio_without.partial_cmp(&a.ratio_without).unwrap_or(std::cmp::Ordering::Equal));
+    candidates
+}
+
 pub fn calculate_misclose(legs: &[(f64, f64)]) -> Option<MiscloseResult> {
     if legs.is_empty() {
         return None;

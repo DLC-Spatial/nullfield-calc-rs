@@ -1,6 +1,8 @@
-use crate::calc::{calculate_misclose, dd_to_dms_string};
-use eframe::egui::{self, Vec2};
+use crate::calc::{calculate_misclose, check_deflection_sum, dd_to_dms_string, detect_blunders, BlunderCandidate};
+use eframe::egui::{self};
 use std::cell::Cell;
+use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 
 fn split_unit(s: &str) -> (&str, &str) {
     let s = s.trim_end();
@@ -141,7 +143,7 @@ fn parse_distance(s: &str) -> Option<f64> {
     Some(val * factor)
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Leg {
     bearing: String,
     distance: String,
@@ -179,6 +181,16 @@ impl Leg {
 
     fn distance_valid(&self) -> bool {
         self.distance.is_empty() || parse_distance(&self.distance).is_some()
+    }
+
+    /// False when the MM or SS field in the DMS input is ≥ 60 (e.g. 45.6230 = 45°62′30″).
+    fn bearing_dms_sane(&self) -> bool {
+        let base = self.bearing_base().trim().trim_start_matches('-');
+        let Some((_, frac)) = base.split_once('.') else { return true };
+        if frac.len() < 2 { return true; }
+        let mm: u32 = frac[..2].parse().unwrap_or(0);
+        let ss: u32 = if frac.len() >= 4 { frac[2..4].parse().unwrap_or(0) } else { 0 };
+        mm < 60 && ss < 60
     }
 
     /// DMS hint for the resolved bearing (always non-empty when valid, "→" prefix when reversed).
@@ -452,14 +464,17 @@ fn draw_traverse_diagram(ctx: &egui::Context, legs: &[(f64, f64)]) {
 
 // --- App ---
 
+#[derive(Serialize, Deserialize)]
 pub struct NullfieldCalcApp {
     legs: Vec<Leg>,
     show_ppm: bool,
     threshold: f64,
+    #[serde(skip)]
     show_diagram: bool,
     start_e: String,
     start_n: String,
     scale_factor: String,
+    threshold_str: String,
 }
 
 impl Default for NullfieldCalcApp {
@@ -472,14 +487,47 @@ impl Default for NullfieldCalcApp {
             start_e: String::new(),
             start_n: String::new(),
             scale_factor: String::new(),
+            threshold_str: "10000".to_string(),
         }
     }
 }
 
+impl NullfieldCalcApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if let Some(storage) = cc.storage {
+            if let Some(mut app) = eframe::get_value::<NullfieldCalcApp>(storage, eframe::APP_KEY) {
+                app.threshold_str = format!("{:.0}", app.threshold);
+                return app;
+            }
+        }
+        Self::default()
+    }
+}
+
 impl eframe::App for NullfieldCalcApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, self);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let valid_legs: Vec<(f64, f64)> = self.legs.iter().filter_map(|l| l.parse()).collect();
+        let (valid_legs, valid_leg_orig_idx): (Vec<(f64, f64)>, Vec<usize>) = self
+            .legs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.parse().map(|p| (p, i)))
+            .unzip();
         let misclose = calculate_misclose(&valid_legs);
+        let deflection = check_deflection_sum(&valid_legs);
+        let blunder_candidates: Vec<BlunderCandidate> = match &misclose {
+            Some(m) if valid_legs.len() >= 4 && !m.ratio.is_infinite() && m.ratio < self.threshold => {
+                detect_blunders(&valid_legs, m.ratio)
+            }
+            _ => vec![],
+        };
+        let suspect_orig_indices: HashSet<usize> = blunder_candidates
+            .iter()
+            .map(|c| valid_leg_orig_idx[c.leg_index])
+            .collect();
 
         let start_e_val = self.start_e.trim().parse::<f64>().ok();
         let start_n_val = self.start_n.trim().parse::<f64>().ok();
@@ -524,7 +572,7 @@ impl eframe::App for NullfieldCalcApp {
         }
 
         egui::TopBottomPanel::bottom("misclose_panel")
-            .min_height(145.0)
+            .min_height(180.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
 
@@ -618,7 +666,77 @@ impl eframe::App for NullfieldCalcApp {
                                     ui.label("");
                                 }
                                 ui.end_row();
+
+                                if let Some(d) = &deflection {
+                                    ui.strong("Angle sum");
+                                    let abs_err = d.error_deg.abs();
+                                    let dir = if d.sum_deg >= 0.0 { "CW" } else { "CCW" };
+                                    let (def_text, def_color) = if abs_err < 0.001 {
+                                        (
+                                            format!("360°00'00\" {dir}"),
+                                            egui::Color32::from_rgb(100, 200, 100),
+                                        )
+                                    } else if abs_err < 0.1 {
+                                        (
+                                            format!("off {} {dir}", dd_to_dms_string(abs_err)),
+                                            egui::Color32::from_rgb(230, 160, 40),
+                                        )
+                                    } else {
+                                        (
+                                            format!("off {} {dir}", dd_to_dms_string(abs_err)),
+                                            egui::Color32::from_rgb(220, 80, 80),
+                                        )
+                                    };
+                                    ui.label(egui::RichText::new(def_text).monospace().color(def_color));
+                                    if show_coord_col {
+                                        ui.label("");
+                                        ui.label("");
+                                    }
+                                    ui.end_row();
+                                }
                             });
+
+                        if !blunder_candidates.is_empty() {
+                            ui.add_space(6.0);
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Possible blunder")
+                                    .color(egui::Color32::from_rgb(230, 160, 40))
+                                    .strong(),
+                            );
+                            egui::Grid::new("blunder_grid")
+                                .num_columns(4)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Leg");
+                                    ui.strong("Bearing");
+                                    ui.strong("Distance");
+                                    ui.strong("Ratio without");
+                                    ui.end_row();
+                                    for c in &blunder_candidates {
+                                        let orig_i = valid_leg_orig_idx[c.leg_index];
+                                        let leg = &self.legs[orig_i];
+                                        ui.label(
+                                            egui::RichText::new(format!("{}", orig_i + 1))
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(230, 160, 40)),
+                                        );
+                                        ui.label(egui::RichText::new(&leg.bearing).monospace());
+                                        ui.label(egui::RichText::new(&leg.distance).monospace());
+                                        let ratio_text = if c.ratio_without.is_infinite() {
+                                            "perfect closure".to_string()
+                                        } else {
+                                            format!("1:{:.0}", c.ratio_without)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(ratio_text)
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(100, 200, 100)),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        }
                     }
                 });
 
@@ -627,6 +745,45 @@ impl eframe::App for NullfieldCalcApp {
                     ui.label("Accuracy:");
                     ui.radio_value(&mut self.show_ppm, false, "Ratio");
                     ui.radio_value(&mut self.show_ppm, true, "PPM");
+
+                    ui.separator();
+                    ui.label("Pass threshold  1:");
+                    let thr_ok = self.threshold_str.trim().parse::<f64>().map(|v| v > 0.0).unwrap_or(false);
+                    ui.scope(|ui| {
+                        if !thr_ok {
+                            ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(80, 20, 20);
+                        }
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.threshold_str).desired_width(80.0),
+                        );
+                        if resp.changed() {
+                            if let Ok(v) = self.threshold_str.trim().parse::<f64>() {
+                                if v > 0.0 {
+                                    self.threshold = v;
+                                }
+                            }
+                        }
+                    });
+
+                    if let Some(m) = &misclose {
+                        ui.separator();
+                        let copy_text = format!(
+                            "Bearing:    {}\nDistance:   {:.4} m\nTotal Dist: {:.3} m\nAccuracy:   {}",
+                            dd_to_dms_string(m.bearing_dd),
+                            m.distance,
+                            m.total_distance,
+                            if m.ratio.is_infinite() {
+                                "perfect closure".to_string()
+                            } else if self.show_ppm {
+                                format!("{:.0} ppm", m.ppm)
+                            } else {
+                                format!("1:{:.0}", m.ratio)
+                            },
+                        );
+                        if ui.button("Copy").clicked() {
+                            ctx.copy_text(copy_text);
+                        }
+                    }
                 });
             });
 
@@ -748,6 +905,7 @@ impl eframe::App for NullfieldCalcApp {
 
                                 // Bearing cell: input above, DMS hint below (always rendered)
                                 let b_valid = self.legs[i].bearing_valid();
+                                let is_suspect = suspect_orig_indices.contains(&i);
                                 let b_resp = ui
                                     .vertical(|ui| {
                                         let resp = ui
@@ -755,6 +913,9 @@ impl eframe::App for NullfieldCalcApp {
                                                 if !b_valid {
                                                     ui.visuals_mut().extreme_bg_color =
                                                         egui::Color32::from_rgb(80, 20, 20);
+                                                } else if is_suspect {
+                                                    ui.visuals_mut().extreme_bg_color =
+                                                        egui::Color32::from_rgb(90, 65, 10);
                                                 }
                                                 ui.add(
                                                     egui::TextEdit::singleline(
@@ -766,12 +927,21 @@ impl eframe::App for NullfieldCalcApp {
                                                 )
                                             })
                                             .inner;
-                                        ui.label(
-                                            egui::RichText::new(self.legs[i].bearing_hint())
-                                                .color(egui::Color32::GRAY)
-                                                .size(11.0)
-                                                .monospace(),
-                                        );
+                                        if b_valid && !self.legs[i].bearing_dms_sane() {
+                                            ui.label(
+                                                egui::RichText::new("MM or SS ≥ 60")
+                                                    .color(egui::Color32::from_rgb(230, 160, 40))
+                                                    .size(11.0)
+                                                    .monospace(),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(self.legs[i].bearing_hint())
+                                                    .color(egui::Color32::GRAY)
+                                                    .size(11.0)
+                                                    .monospace(),
+                                            );
+                                        }
                                         resp
                                     })
                                     .inner;
@@ -791,6 +961,9 @@ impl eframe::App for NullfieldCalcApp {
                                                 if !d_valid {
                                                     ui.visuals_mut().extreme_bg_color =
                                                         egui::Color32::from_rgb(80, 20, 20);
+                                                } else if is_suspect {
+                                                    ui.visuals_mut().extreme_bg_color =
+                                                        egui::Color32::from_rgb(90, 65, 10);
                                                 }
                                                 ui.add(
                                                     egui::TextEdit::singleline(

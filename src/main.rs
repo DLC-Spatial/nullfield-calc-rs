@@ -16,6 +16,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "nullfield-calc",
         native_options,
-        Box::new(|_cc| Ok(Box::new(app::NullfieldCalcApp::default()))),
+        Box::new(|cc| Ok(Box::new(app::NullfieldCalcApp::new(cc)))),
     )
 }
