@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 astro-float = "0.9.5"
-eframe = { version = "0.29", features = ["persistence"] }
+eframe = { version = "0.34.2", features = ["persistence"] }
 serde = { version = "1", features = ["derive"] }

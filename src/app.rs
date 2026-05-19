@@ -298,8 +298,8 @@ fn arrow_tip(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, color: e
     ));
 }
 
-fn draw_traverse_diagram(ctx: &egui::Context, legs: &[(f64, f64)]) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
+    egui::CentralPanel::default().show_inside(ui, |ui| {
         let rect = ui.max_rect();
         let painter = ui.painter_at(rect);
 
@@ -509,7 +509,8 @@ impl eframe::App for NullfieldCalcApp {
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         let (valid_legs, valid_leg_orig_idx): (Vec<(f64, f64)>, Vec<usize>) = self
             .legs
             .iter()
@@ -558,12 +559,12 @@ impl eframe::App for NullfieldCalcApp {
                     .with_title("Traverse Diagram")
                     .with_min_inner_size([300.0, 300.0])
                     .with_inner_size([600.0, 600.0]),
-                |ctx, _class| {
-                    if ctx.input(|i| i.viewport().close_requested()) {
+                |ui, _class| {
+                    if ui.ctx().input(|i| i.viewport().close_requested()) {
                         close_diagram.set(true);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    draw_traverse_diagram(ctx, &snap);
+                    draw_traverse_diagram(ui, &snap);
                 },
             );
         }
@@ -571,9 +572,9 @@ impl eframe::App for NullfieldCalcApp {
             self.show_diagram = false;
         }
 
-        egui::TopBottomPanel::bottom("misclose_panel")
-            .min_height(180.0)
-            .show(ctx, |ui| {
+        egui::Panel::bottom("misclose_panel")
+            .min_size(180.0)
+            .show_inside(ui, |ui| {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
@@ -787,7 +788,7 @@ impl eframe::App for NullfieldCalcApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Misclose Calculator");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
