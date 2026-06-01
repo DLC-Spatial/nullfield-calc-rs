@@ -876,6 +876,7 @@ impl eframe::App for NullfieldCalcApp {
             ui.add_space(4.0);
 
             let mut to_remove: Option<usize> = None;
+            let mut to_insert: Option<usize> = None;
             let mut next_focus: Option<egui::Id> = None;
             let mut add_leg = false;
             let num_legs = self.legs.len();
@@ -885,8 +886,8 @@ impl eframe::App for NullfieldCalcApp {
                 .show(ui, |ui| {
                     egui::Grid::new("legs_grid")
                         .num_columns(if has_coords { 5 } else { 4 })
-                        .spacing([10.0, 6.0])
-                        .striped(true)
+                        .spacing([10.0, 2.0])
+                        .striped(false)
                         .show(ui, |ui| {
                             // Header row (row 0 — unstriped by egui's alternating scheme)
                             ui.strong("#");
@@ -1027,12 +1028,64 @@ impl eframe::App for NullfieldCalcApp {
                                     to_remove = Some(i);
                                 }
                                 ui.end_row();
+
+                                if i + 1 < num_legs {
+                                    const SEP_H: f32 = 4.0;
+                                    let num_cols = if has_coords { 5 } else { 4 };
+                                    let mut rects: Vec<egui::Rect> =
+                                        Vec::with_capacity(num_cols);
+                                    let mut sep_hovered = false;
+                                    let mut sep_clicked = false;
+                                    for _ in 0..num_cols {
+                                        let r = ui.allocate_response(
+                                            egui::vec2(ui.available_width(), SEP_H),
+                                            egui::Sense::click(),
+                                        );
+                                        sep_hovered |= r.hovered();
+                                        sep_clicked |= r.clicked();
+                                        rects.push(r.rect);
+                                    }
+                                    if sep_hovered {
+                                        let x_min = rects.first().unwrap().left();
+                                        let x_max = rects.last().unwrap().right();
+                                        let y = rects[0].center().y;
+                                        let painter = ui.painter();
+                                        painter.line_segment(
+                                            [egui::pos2(x_min, y), egui::pos2(x_max, y)],
+                                            egui::Stroke::new(
+                                                1.5,
+                                                egui::Color32::from_rgb(80, 150, 255),
+                                            ),
+                                        );
+                                        let cx = rects.last().unwrap().center().x;
+                                        painter.circle_filled(
+                                            egui::pos2(cx, y),
+                                            7.0,
+                                            egui::Color32::from_rgb(60, 120, 220),
+                                        );
+                                        painter.text(
+                                            egui::pos2(cx, y),
+                                            egui::Align2::CENTER_CENTER,
+                                            "+",
+                                            egui::FontId::proportional(12.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                    if sep_clicked {
+                                        to_insert = Some(i + 1);
+                                    }
+                                    ui.end_row();
+                                }
                             }
                         });
                 });
 
             if let Some(i) = to_remove {
                 self.legs.remove(i);
+            }
+            if let Some(i) = to_insert {
+                self.legs.insert(i, Leg::default());
+                next_focus = Some(egui::Id::new(("bearing", i)));
             }
             if add_leg {
                 self.legs.push(Leg::default());
@@ -1046,5 +1099,9 @@ impl eframe::App for NullfieldCalcApp {
                 self.legs.push(Leg::default());
             }
         });
+
+        // Keep the event loop alive so the WM's liveness ping is answered
+        // even when the app is idle and unfocused.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
