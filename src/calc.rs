@@ -15,19 +15,19 @@ fn bf_to_f64(x: &BigFloat) -> f64 {
 
 /// Convert DMS bearing (DDD.MMSS) to radians at full precision.
 fn dms_to_rad(dms: f64, cc: &mut Consts) -> BigFloat {
-    let dms = f(dms);
-    let degrees = dms.floor();
-    let rem = dms.sub(&degrees, PREC, RM).mul(&f(100.0), PREC, RM);
-    let minutes = rem.floor();
-    let seconds = rem.sub(&minutes, PREC, RM).mul(&f(100.0), PREC, RM);
-    let dd = degrees
-        .add(&minutes.div(&f(60.0), PREC, RM), PREC, RM)
-        .add(&seconds.div(&f(3600.0), PREC, RM), PREC, RM);
     let pi = cc.pi(PREC, RM);
-    dd.mul(&pi, PREC, RM).div(&f(180.0), PREC, RM)
+    f(dms_to_dd(dms))
+        .mul(&pi, PREC, RM)
+        .div(&f(180.0), PREC, RM)
 }
 
-fn radiate(e: &BigFloat, n: &BigFloat, bearing_dms: f64, distance: f64, cc: &mut Consts) -> (BigFloat, BigFloat) {
+fn radiate(
+    e: &BigFloat,
+    n: &BigFloat,
+    bearing_dms: f64,
+    distance: f64,
+    cc: &mut Consts,
+) -> (BigFloat, BigFloat) {
     let rad = dms_to_rad(bearing_dms, cc);
     let dist = f(distance);
     let sin_b = rad.sin(PREC, RM, cc);
@@ -90,12 +90,12 @@ pub struct MiscloseResult {
 /// Compute traverse misclose from (bearing_dms, distance) legs at 256-bit precision.
 fn dms_to_dd(dms: f64) -> f64 {
     let sign = if dms < 0.0 { -1.0 } else { 1.0 };
-    let dms = dms.abs();
-    let d = dms.trunc();
-    let frac = (dms - d) * 100.0;
-    let m = frac.trunc();
-    let s = (frac - m) * 100.0;
-    sign * (d + m / 60.0 + s / 3600.0)
+    let packed = (dms.abs() * 10_000.0).round() as i64;
+    let d = packed / 10_000;
+    let mmss = packed % 10_000;
+    let m = mmss / 100;
+    let s = mmss % 100;
+    sign * (d as f64 + m as f64 / 60.0 + s as f64 / 3600.0)
 }
 
 pub struct DeflectionCheck {
@@ -117,7 +117,10 @@ pub fn check_deflection_sum(legs: &[(f64, f64)]) -> Option<DeflectionCheck> {
         })
         .sum();
     let error_deg = sum.abs() - 360.0;
-    Some(DeflectionCheck { sum_deg: sum, error_deg })
+    Some(DeflectionCheck {
+        sum_deg: sum,
+        error_deg,
+    })
 }
 
 const BLUNDER_IMPROVEMENT_FACTOR: f64 = 3.0;
@@ -133,15 +136,28 @@ pub fn detect_blunders(legs: &[(f64, f64)], current_ratio: f64) -> Vec<BlunderCa
     }
     let mut candidates: Vec<BlunderCandidate> = (0..legs.len())
         .filter_map(|i| {
-            let reduced: Vec<_> = legs[..i].iter().chain(legs[i + 1..].iter()).copied().collect();
+            let reduced: Vec<_> = legs[..i]
+                .iter()
+                .chain(legs[i + 1..].iter())
+                .copied()
+                .collect();
             let ratio_without = calculate_misclose(&reduced)?.ratio;
-            if ratio_without.is_finite() && ratio_without < current_ratio * BLUNDER_IMPROVEMENT_FACTOR {
+            if ratio_without.is_finite()
+                && ratio_without < current_ratio * BLUNDER_IMPROVEMENT_FACTOR
+            {
                 return None;
             }
-            Some(BlunderCandidate { leg_index: i, ratio_without })
+            Some(BlunderCandidate {
+                leg_index: i,
+                ratio_without,
+            })
         })
         .collect();
-    candidates.sort_by(|a, b| b.ratio_without.partial_cmp(&a.ratio_without).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.ratio_without
+            .partial_cmp(&a.ratio_without)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     candidates
 }
 
@@ -188,4 +204,38 @@ pub fn calculate_misclose(legs: &[(f64, f64)]) -> Option<MiscloseResult> {
         ratio,
         ppm,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calculate_misclose, dms_to_dd};
+
+    #[test]
+    fn dms_to_dd_handles_boundary_minute_values() {
+        let expected = 253.0 + (1.0 / 60.0);
+        let actual = dms_to_dd(253.0100);
+        assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn traverse_result_is_stable_for_tiny_hp_epsilon() {
+        let legs = vec![
+            (162.5146, 12.0),
+            (73.0100, 133.260),
+            (337.3927, 12.053),
+            (253.0100, 134.353),
+        ];
+        let legs_with_epsilon = vec![
+            (162.5146, 12.0),
+            (73.0100, 133.260),
+            (337.3927, 12.053),
+            (253.010000001, 134.353),
+        ];
+
+        let baseline = calculate_misclose(&legs).expect("baseline misclose");
+        let epsilon = calculate_misclose(&legs_with_epsilon).expect("epsilon misclose");
+
+        assert!((baseline.distance - epsilon.distance).abs() < 1e-12);
+        assert!((baseline.bearing_dd - epsilon.bearing_dd).abs() < 1e-12);
+    }
 }
