@@ -68,15 +68,25 @@ fn atan2_bearing(east: &BigFloat, north: &BigFloat, cc: &mut Consts) -> BigFloat
     }
 }
 
-/// Format decimal degrees (f64) as DDD°MM'SS.ss"
+/// Format decimal degrees (f64) as DDD°MM'SS.ss" — extends to four decimal
+/// places of seconds when sub-second precision is present, otherwise keeps two.
 pub fn dd_to_dms_string(dd: f64) -> String {
     let dd = dd.rem_euclid(360.0);
     let total_sec = dd * 3600.0;
     let d = (total_sec / 3600.0).floor() as u32;
     let rem = total_sec - d as f64 * 3600.0;
     let m = (rem / 60.0).floor() as u32;
-    let s = (rem - m as f64 * 60.0).clamp(0.0, 59.99);
-    format!("{:03}°{:02}'{:05.2}\"", d, m, s)
+    let s = (rem - m as f64 * 60.0).clamp(0.0, 59.9999);
+    format!("{:03}°{:02}'{}\"", d, m, format_seconds(s))
+}
+
+/// Seconds with two decimal places, extended up to four to show sub-second precision.
+fn format_seconds(s: f64) -> String {
+    let mut out = format!("{:07.4}", s);
+    while out.ends_with('0') && out.split('.').nth(1).is_some_and(|f| f.len() > 2) {
+        out.pop();
+    }
+    out
 }
 
 pub struct MiscloseResult {
@@ -87,15 +97,22 @@ pub struct MiscloseResult {
     pub ppm: f64,
 }
 
-/// Compute traverse misclose from (bearing_dms, distance) legs at 256-bit precision.
-fn dms_to_dd(dms: f64) -> f64 {
+/// Convert a packed DMS bearing (`DDD.MMSSssss`) to decimal degrees.
+///
+/// The two digits after the point are minutes, the next two are whole seconds,
+/// and any further digits are fractional seconds (`253.01001234` =
+/// 253°01′00.1234″). Packing to a 1e-8 integer rounds away f64 representation
+/// noise (~1e-13) so the minute/second boundaries don't collapse, while keeping
+/// up to four sub-second digits the user types past the SS field. This is the
+/// single conversion used by both the calculation and the UI.
+pub fn dms_to_dd(dms: f64) -> f64 {
     let sign = if dms < 0.0 { -1.0 } else { 1.0 };
-    let packed = (dms.abs() * 10_000.0).round() as i64;
-    let d = packed / 10_000;
-    let mmss = packed % 10_000;
-    let m = mmss / 100;
-    let s = mmss % 100;
-    sign * (d as f64 + m as f64 / 60.0 + s as f64 / 3600.0)
+    let packed = (dms.abs() * 1e8).round() as i64;
+    let d = packed / 100_000_000;
+    let mmss = packed % 100_000_000; // MMSSssss
+    let m = mmss / 1_000_000; // MM
+    let s = (mmss % 1_000_000) as f64 / 1e4; // SS.ssss
+    sign * (d as f64 + m as f64 / 60.0 + s / 3600.0)
 }
 
 pub struct DeflectionCheck {
@@ -208,13 +225,31 @@ pub fn calculate_misclose(legs: &[(f64, f64)]) -> Option<MiscloseResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_misclose, dms_to_dd};
+    use super::{calculate_misclose, dd_to_dms_string, dms_to_dd};
 
     #[test]
     fn dms_to_dd_handles_boundary_minute_values() {
         let expected = 253.0 + (1.0 / 60.0);
         let actual = dms_to_dd(253.0100);
         assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dms_to_dd_preserves_sub_second_precision() {
+        // 253.01001234 = 253°01'00.1234"
+        let expected = 253.0 + 1.0 / 60.0 + 0.1234 / 3600.0;
+        let actual = dms_to_dd(253.01001234);
+        assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dd_to_dms_string_shows_sub_second_digits() {
+        assert_eq!(dd_to_dms_string(dms_to_dd(253.01001234)), "253°01'00.1234\"");
+    }
+
+    #[test]
+    fn dd_to_dms_string_keeps_two_decimals_without_sub_second() {
+        assert_eq!(dd_to_dms_string(dms_to_dd(253.0100)), "253°01'00.00\"");
     }
 
     #[test]

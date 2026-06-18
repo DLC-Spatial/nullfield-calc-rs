@@ -1,8 +1,11 @@
-use crate::calc::{calculate_misclose, check_deflection_sum, dd_to_dms_string, detect_blunders, BlunderCandidate};
+use crate::calc::{
+    calculate_misclose, check_deflection_sum, dd_to_dms_string, detect_blunders, dms_to_dd,
+    BlunderCandidate,
+};
 use eframe::egui::{self};
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashSet;
-use serde::{Deserialize, Serialize};
 
 fn split_unit(s: &str) -> (&str, &str) {
     let s = s.trim_end();
@@ -186,10 +189,18 @@ impl Leg {
     /// False when the MM or SS field in the DMS input is ≥ 60 (e.g. 45.6230 = 45°62′30″).
     fn bearing_dms_sane(&self) -> bool {
         let base = self.bearing_base().trim().trim_start_matches('-');
-        let Some((_, frac)) = base.split_once('.') else { return true };
-        if frac.len() < 2 { return true; }
+        let Some((_, frac)) = base.split_once('.') else {
+            return true;
+        };
+        if frac.len() < 2 {
+            return true;
+        }
         let mm: u32 = frac[..2].parse().unwrap_or(0);
-        let ss: u32 = if frac.len() >= 4 { frac[2..4].parse().unwrap_or(0) } else { 0 };
+        let ss: u32 = if frac.len() >= 4 {
+            frac[2..4].parse().unwrap_or(0)
+        } else {
+            0
+        };
         mm < 60 && ss < 60
     }
 
@@ -209,12 +220,7 @@ impl Leg {
             b
         };
         let prefix = if self.is_reversed() { "→ " } else { "" };
-        let deg = resolved.floor() as u32;
-        let frac = resolved - resolved.floor();
-        let min_f = frac * 100.0;
-        let min = min_f.floor() as u32;
-        let sec = ((min_f - min as f64) * 100.0).clamp(0.0, 59.99);
-        format!("{}{:03}°{:02}'{:05.2}\"", prefix, deg, min, sec)
+        format!("{}{}", prefix, dd_to_dms_string(dms_to_dd(resolved)))
     }
 
     /// Metres hint shown when arithmetic or unit conversion is present.
@@ -239,12 +245,7 @@ impl Leg {
 // --- Coordinate helpers ---
 
 fn dms_to_rad_f64(bearing_dms: f64) -> f64 {
-    let deg = bearing_dms.floor();
-    let rem = (bearing_dms - deg) * 100.0;
-    let min = rem.floor();
-    let sec = (rem - min) * 100.0;
-    let dd = deg + min / 60.0 + sec / 3600.0;
-    dd.to_radians()
+    dms_to_dd(bearing_dms).to_radians()
 }
 
 /// Compute (E, N) after each leg; None for invalid legs (cursor still advances for valid ones).
@@ -520,7 +521,9 @@ impl eframe::App for NullfieldCalcApp {
         let misclose = calculate_misclose(&valid_legs);
         let deflection = check_deflection_sum(&valid_legs);
         let blunder_candidates: Vec<BlunderCandidate> = match &misclose {
-            Some(m) if valid_legs.len() >= 4 && !m.ratio.is_infinite() && m.ratio < self.threshold => {
+            Some(m)
+                if valid_legs.len() >= 4 && !m.ratio.is_infinite() && m.ratio < self.threshold =>
+            {
                 detect_blunders(&valid_legs, m.ratio)
             }
             _ => vec![],
@@ -1032,8 +1035,7 @@ impl eframe::App for NullfieldCalcApp {
                                 if i + 1 < num_legs {
                                     const SEP_H: f32 = 4.0;
                                     let num_cols = if has_coords { 5 } else { 4 };
-                                    let mut rects: Vec<egui::Rect> =
-                                        Vec::with_capacity(num_cols);
+                                    let mut rects: Vec<egui::Rect> = Vec::with_capacity(num_cols);
                                     let mut sep_hovered = false;
                                     let mut sep_clicked = false;
                                     for _ in 0..num_cols {
