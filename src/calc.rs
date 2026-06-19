@@ -108,6 +108,7 @@ fn format_seconds(s: f64, max_decimals: usize) -> String {
     out
 }
 
+#[derive(Clone)]
 pub struct MiscloseResult {
     pub bearing_dd: f64,
     pub distance: f64,
@@ -134,6 +135,7 @@ pub fn dms_to_dd(dms: f64) -> f64 {
     sign * (d as f64 + m as f64 / 60.0 + s / 3600.0)
 }
 
+#[derive(Clone)]
 pub struct DeflectionCheck {
     pub sum_deg: f64,
     pub error_deg: f64,
@@ -161,6 +163,7 @@ pub fn check_deflection_sum(legs: &[(f64, f64)]) -> Option<DeflectionCheck> {
 
 const BLUNDER_IMPROVEMENT_FACTOR: f64 = 3.0;
 
+#[derive(Clone)]
 pub struct BlunderCandidate {
     pub leg_index: usize,
     pub ratio_without: f64,
