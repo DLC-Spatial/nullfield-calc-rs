@@ -71,19 +71,38 @@ fn atan2_bearing(east: &BigFloat, north: &BigFloat, cc: &mut Consts) -> BigFloat
 /// Format decimal degrees (f64) as DDD°MM'SS.ss" — extends to four decimal
 /// places of seconds when sub-second precision is present, otherwise keeps two.
 pub fn dd_to_dms_string(dd: f64) -> String {
+    dd_to_dms_string_prec(dd, 4)
+}
+
+/// Like [`dd_to_dms_string`] but caps seconds at `max_decimals` places; trailing zeros
+/// are trimmed so ordinary values still read as `SS.ss` (or `SS` when `max_decimals` is 0).
+pub fn dd_to_dms_string_prec(dd: f64, max_decimals: usize) -> String {
     let dd = dd.rem_euclid(360.0);
     let total_sec = dd * 3600.0;
     let d = (total_sec / 3600.0).floor() as u32;
     let rem = total_sec - d as f64 * 3600.0;
     let m = (rem / 60.0).floor() as u32;
-    let s = (rem - m as f64 * 60.0).clamp(0.0, 59.9999);
-    format!("{:03}°{:02}'{}\"", d, m, format_seconds(s))
+    // Largest value that still renders below 60 at this precision, so seconds never round up.
+    let max_s = 60.0 - 10f64.powi(-(max_decimals as i32));
+    let s = (rem - m as f64 * 60.0).clamp(0.0, max_s);
+    format!("{:03}°{:02}'{}\"", d, m, format_seconds(s, max_decimals))
 }
 
-/// Seconds with two decimal places, extended up to four to show sub-second precision.
-fn format_seconds(s: f64) -> String {
-    let mut out = format!("{:07.4}", s);
-    while out.ends_with('0') && out.split('.').nth(1).is_some_and(|f| f.len() > 2) {
+/// Seconds rendered with up to `max_decimals` places; trailing zeros are trimmed but at
+/// least `min(2, max_decimals)` decimals are kept so ordinary values still read as `SS.ss`.
+fn format_seconds(s: f64, max_decimals: usize) -> String {
+    if max_decimals == 0 {
+        return format!("{s:02.0}");
+    }
+    let min_decimals = max_decimals.min(2);
+    let width = 3 + max_decimals;
+    let mut out = format!("{s:0width$.max_decimals$}");
+    while out.ends_with('0')
+        && out
+            .split('.')
+            .nth(1)
+            .is_some_and(|f| f.len() > min_decimals)
+    {
         out.pop();
     }
     out
@@ -225,7 +244,7 @@ pub fn calculate_misclose(legs: &[(f64, f64)]) -> Option<MiscloseResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_misclose, dd_to_dms_string, dms_to_dd};
+    use super::{calculate_misclose, dd_to_dms_string, dd_to_dms_string_prec, dms_to_dd};
 
     #[test]
     fn dms_to_dd_handles_boundary_minute_values() {
@@ -244,7 +263,18 @@ mod tests {
 
     #[test]
     fn dd_to_dms_string_shows_sub_second_digits() {
-        assert_eq!(dd_to_dms_string(dms_to_dd(253.01001234)), "253°01'00.1234\"");
+        assert_eq!(
+            dd_to_dms_string(dms_to_dd(253.01001234)),
+            "253°01'00.1234\""
+        );
+    }
+
+    #[test]
+    fn dd_to_dms_string_prec_zero_drops_seconds_decimals() {
+        assert_eq!(
+            dd_to_dms_string_prec(dms_to_dd(253.01001234), 0),
+            "253°01'00\""
+        );
     }
 
     #[test]

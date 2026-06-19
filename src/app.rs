@@ -1,6 +1,6 @@
 use crate::calc::{
-    calculate_misclose, check_deflection_sum, dd_to_dms_string, detect_blunders, dms_to_dd,
-    BlunderCandidate,
+    calculate_misclose, check_deflection_sum, dd_to_dms_string, dd_to_dms_string_prec,
+    detect_blunders, dms_to_dd, BlunderCandidate,
 };
 use eframe::egui::{self};
 use serde::{Deserialize, Serialize};
@@ -465,6 +465,51 @@ fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
 
 // --- App ---
 
+/// Background tint for an invalid input field, kept readable against the active theme.
+fn error_bg(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(80, 20, 20)
+    } else {
+        egui::Color32::from_rgb(255, 205, 205)
+    }
+}
+
+/// Background tint for a suspected-blunder input field, kept readable against the active theme.
+fn suspect_bg(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(90, 65, 10)
+    } else {
+        egui::Color32::from_rgb(255, 230, 160)
+    }
+}
+
+/// User-tunable display and appearance settings, persisted with the app.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct Settings {
+    /// Decimal places for distances (misclose, total).
+    distance_decimals: usize,
+    /// Decimal places for E/N coordinates.
+    coord_decimals: usize,
+    /// Max decimal places of seconds in bearing readouts (trailing zeros trimmed to 2).
+    seconds_decimals: usize,
+    dark_mode: bool,
+    /// egui zoom factor applied over native DPI.
+    ui_scale: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            distance_decimals: 4,
+            coord_decimals: 3,
+            seconds_decimals: 4,
+            dark_mode: true,
+            ui_scale: 1.0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct NullfieldCalcApp {
     legs: Vec<Leg>,
@@ -476,6 +521,10 @@ pub struct NullfieldCalcApp {
     start_n: String,
     scale_factor: String,
     threshold_str: String,
+    #[serde(default)]
+    settings: Settings,
+    #[serde(skip)]
+    show_settings: bool,
 }
 
 impl Default for NullfieldCalcApp {
@@ -489,6 +538,8 @@ impl Default for NullfieldCalcApp {
             start_n: String::new(),
             scale_factor: String::new(),
             threshold_str: "10000".to_string(),
+            settings: Settings::default(),
+            show_settings: false,
         }
     }
 }
@@ -512,6 +563,45 @@ impl eframe::App for NullfieldCalcApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        ctx.set_zoom_factor(self.settings.ui_scale);
+        ctx.set_visuals(if self.settings.dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+
+        // Settings overlay — rendered before the panels borrow `self`.
+        let mut show_settings = self.show_settings;
+        egui::Window::new("⚙ Settings")
+            .open(&mut show_settings)
+            .resizable(false)
+            .collapsible(false)
+            .show(&ctx, |ui| {
+                let s = &mut self.settings;
+                ui.label(egui::RichText::new("Display precision").strong());
+                ui.add(
+                    egui::Slider::new(&mut s.distance_decimals, 0..=6).text("Distance decimals"),
+                );
+                ui.add(egui::Slider::new(&mut s.coord_decimals, 0..=6).text("Coordinate decimals"));
+                ui.add(
+                    egui::Slider::new(&mut s.seconds_decimals, 0..=6).text("Bearing seconds (max)"),
+                );
+                ui.separator();
+                ui.label(egui::RichText::new("Appearance").strong());
+                ui.checkbox(&mut s.dark_mode, "Dark mode");
+                ui.add(
+                    egui::Slider::new(&mut s.ui_scale, 0.8..=1.6)
+                        .step_by(0.05)
+                        .text("UI scale"),
+                );
+                ui.separator();
+                if ui.button("Reset to defaults").clicked() {
+                    *s = Settings::default();
+                }
+            });
+        self.show_settings = show_settings;
+
         let (valid_legs, valid_leg_orig_idx): (Vec<(f64, f64)>, Vec<usize>) = self
             .legs
             .iter()
@@ -609,42 +699,44 @@ impl eframe::App for NullfieldCalcApp {
                             .show(ui, |ui| {
                                 ui.strong("Bearing");
                                 ui.label(
-                                    egui::RichText::new(dd_to_dms_string(m.bearing_dd))
-                                        .size(15.0)
-                                        .monospace(),
+                                    egui::RichText::new(dd_to_dms_string_prec(
+                                        m.bearing_dd,
+                                        self.settings.seconds_decimals,
+                                    ))
+                                    .size(15.0)
+                                    .monospace(),
                                 );
                                 if let Some((fe, _)) = final_coord {
                                     ui.strong("Final E");
                                     ui.label(
-                                        egui::RichText::new(format!("{:.3}", fe))
-                                            .monospace()
-                                            .color(coord_color),
+                                        egui::RichText::new(format!(
+                                            "{:.*}",
+                                            self.settings.coord_decimals, fe
+                                        ))
+                                        .monospace()
+                                        .color(coord_color),
                                     );
                                 }
                                 ui.end_row();
 
                                 ui.strong("Distance");
                                 ui.label(
-                                    egui::RichText::new(format!("{:.4} m", m.distance)).monospace(),
+                                    egui::RichText::new(format!(
+                                        "{:.*} m",
+                                        self.settings.distance_decimals, m.distance
+                                    ))
+                                    .monospace(),
                                 );
                                 if let Some((_, fn_)) = final_coord {
                                     ui.strong("Final N");
                                     ui.label(
-                                        egui::RichText::new(format!("{:.3}", fn_))
-                                            .monospace()
-                                            .color(coord_color),
+                                        egui::RichText::new(format!(
+                                            "{:.*}",
+                                            self.settings.coord_decimals, fn_
+                                        ))
+                                        .monospace()
+                                        .color(coord_color),
                                     );
-                                }
-                                ui.end_row();
-
-                                ui.strong("Total Dist");
-                                ui.label(
-                                    egui::RichText::new(format!("{:.3} m", m.total_distance))
-                                        .monospace(),
-                                );
-                                if show_coord_col {
-                                    ui.label("");
-                                    ui.label("");
                                 }
                                 ui.end_row();
 
@@ -699,6 +791,16 @@ impl eframe::App for NullfieldCalcApp {
                                     ui.end_row();
                                 }
                             });
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Traverse length  {:.*} m",
+                                self.settings.distance_decimals, m.total_distance
+                            ))
+                            .color(egui::Color32::GRAY)
+                            .monospace(),
+                        );
 
                         if !blunder_candidates.is_empty() {
                             ui.add_space(6.0);
@@ -755,7 +857,7 @@ impl eframe::App for NullfieldCalcApp {
                     let thr_ok = self.threshold_str.trim().parse::<f64>().map(|v| v > 0.0).unwrap_or(false);
                     ui.scope(|ui| {
                         if !thr_ok {
-                            ui.visuals_mut().extreme_bg_color = egui::Color32::from_rgb(80, 20, 20);
+                            ui.visuals_mut().extreme_bg_color = error_bg(ui);
                         }
                         let resp = ui.add(
                             egui::TextEdit::singleline(&mut self.threshold_str).desired_width(80.0),
@@ -772,9 +874,11 @@ impl eframe::App for NullfieldCalcApp {
                     if let Some(m) = &misclose {
                         ui.separator();
                         let copy_text = format!(
-                            "Bearing:    {}\nDistance:   {:.4} m\nTotal Dist: {:.3} m\nAccuracy:   {}",
-                            dd_to_dms_string(m.bearing_dd),
+                            "Bearing:    {}\nDistance:   {:.*} m\nTraverse:   {:.*} m\nAccuracy:   {}",
+                            dd_to_dms_string_prec(m.bearing_dd, self.settings.seconds_decimals),
+                            self.settings.distance_decimals,
                             m.distance,
+                            self.settings.distance_decimals,
                             m.total_distance,
                             if m.ratio.is_infinite() {
                                 "perfect closure".to_string()
@@ -801,6 +905,9 @@ impl eframe::App for NullfieldCalcApp {
                         self.start_n = String::new();
                         self.scale_factor = String::new();
                     }
+                    if ui.button("⚙ Settings").clicked() {
+                        self.show_settings = !self.show_settings;
+                    }
                 });
             });
             ui.add_space(6.0);
@@ -817,8 +924,7 @@ impl eframe::App for NullfieldCalcApp {
                     ui.vertical(|ui| {
                         ui.scope(|ui| {
                             if !se_ok {
-                                ui.visuals_mut().extreme_bg_color =
-                                    egui::Color32::from_rgb(80, 20, 20);
+                                ui.visuals_mut().extreme_bg_color = error_bg(ui);
                             }
                             ui.add_sized(
                                 eframe::egui::Vec2::new(110.0, 10.0),
@@ -835,8 +941,7 @@ impl eframe::App for NullfieldCalcApp {
                     ui.vertical(|ui| {
                         ui.scope(|ui| {
                             if !sn_ok {
-                                ui.visuals_mut().extreme_bg_color =
-                                    egui::Color32::from_rgb(80, 20, 20);
+                                ui.visuals_mut().extreme_bg_color = error_bg(ui);
                             }
                             ui.add_sized(
                                 eframe::egui::Vec2::new(110.0, 10.0),
@@ -858,8 +963,7 @@ impl eframe::App for NullfieldCalcApp {
                     ui.vertical(|ui| {
                         ui.scope(|ui| {
                             if !sf_ok {
-                                ui.visuals_mut().extreme_bg_color =
-                                    egui::Color32::from_rgb(80, 20, 20);
+                                ui.visuals_mut().extreme_bg_color = error_bg(ui);
                             }
                             ui.add_sized(
                                 eframe::egui::Vec2::new(110.0, 10.0),
@@ -917,10 +1021,10 @@ impl eframe::App for NullfieldCalcApp {
                                             .scope(|ui| {
                                                 if !b_valid {
                                                     ui.visuals_mut().extreme_bg_color =
-                                                        egui::Color32::from_rgb(80, 20, 20);
+                                                        error_bg(ui);
                                                 } else if is_suspect {
                                                     ui.visuals_mut().extreme_bg_color =
-                                                        egui::Color32::from_rgb(90, 65, 10);
+                                                        suspect_bg(ui);
                                                 }
                                                 ui.add(
                                                     egui::TextEdit::singleline(
@@ -965,10 +1069,10 @@ impl eframe::App for NullfieldCalcApp {
                                             .scope(|ui| {
                                                 if !d_valid {
                                                     ui.visuals_mut().extreme_bg_color =
-                                                        egui::Color32::from_rgb(80, 20, 20);
+                                                        error_bg(ui);
                                                 } else if is_suspect {
                                                     ui.visuals_mut().extreme_bg_color =
-                                                        egui::Color32::from_rgb(90, 65, 10);
+                                                        suspect_bg(ui);
                                                 }
                                                 ui.add(
                                                     egui::TextEdit::singleline(
@@ -1008,16 +1112,22 @@ impl eframe::App for NullfieldCalcApp {
                                                 egui::Color32::from_rgb(140, 200, 140);
                                             ui.vertical(|ui| {
                                                 ui.label(
-                                                    egui::RichText::new(format!("E {:.3}", e))
-                                                        .monospace()
-                                                        .size(11.0)
-                                                        .color(coord_color),
+                                                    egui::RichText::new(format!(
+                                                        "E {:.*}",
+                                                        self.settings.coord_decimals, e
+                                                    ))
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(coord_color),
                                                 );
                                                 ui.label(
-                                                    egui::RichText::new(format!("N {:.3}", n))
-                                                        .monospace()
-                                                        .size(11.0)
-                                                        .color(coord_color),
+                                                    egui::RichText::new(format!(
+                                                        "N {:.*}",
+                                                        self.settings.coord_decimals, n
+                                                    ))
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(coord_color),
                                                 );
                                             });
                                         }
