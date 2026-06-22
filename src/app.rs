@@ -299,6 +299,42 @@ fn arrow_tip(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, color: e
     ));
 }
 
+/// Persistent pan/zoom for the diagram, applied on top of the auto-fit transform.
+/// `zoom` 1.0 and `offset` zero reproduce the auto-fit view.
+#[derive(Clone, Copy)]
+struct DiagramView {
+    offset: egui::Vec2,
+    zoom: f32,
+}
+
+impl Default for DiagramView {
+    fn default() -> Self {
+        Self {
+            offset: egui::Vec2::ZERO,
+            zoom: 1.0,
+        }
+    }
+}
+
+/// Round up to a "nice" 1/2/5 × 10ⁿ value, for scale-bar lengths.
+fn nice_round(x: f64) -> f64 {
+    if x <= 0.0 || !x.is_finite() {
+        return 1.0;
+    }
+    let pow = 10f64.powf(x.log10().floor());
+    let frac = x / pow;
+    let nice = if frac < 1.5 {
+        1.0
+    } else if frac < 3.0 {
+        2.0
+    } else if frac < 7.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * pow
+}
+
 fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
     egui::CentralPanel::default().show_inside(ui, |ui| {
         let rect = ui.max_rect();
@@ -330,7 +366,7 @@ fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
         let span_e = (max_e - min_e) as f32;
         let span_n = (max_n - min_n) as f32;
 
-        let scale = {
+        let fit_scale = {
             let sx = if span_e > 1e-4 {
                 draw_rect.width() / span_e
             } else {
@@ -348,30 +384,54 @@ fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
         let center_n = ((min_n + max_n) / 2.0) as f32;
         let canvas_center = draw_rect.center();
 
+        // --- Pan / zoom interaction ---
+        let view_id = ui.id().with("diagram_view");
+        let mut view = ui
+            .ctx()
+            .data(|d| d.get_temp::<DiagramView>(view_id))
+            .unwrap_or_default();
+
+        let response = ui.interact(
+            rect,
+            ui.id().with("diagram_canvas"),
+            egui::Sense::click_and_drag(),
+        );
+        if response.dragged() {
+            view.offset += response.drag_delta();
+        }
+        if response.double_clicked() {
+            view = DiagramView::default();
+        }
+        if response.hovered() {
+            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll_y != 0.0 {
+                let factor = (scroll_y * 0.0015).exp();
+                let new_zoom = (view.zoom * factor).clamp(0.05, 50.0);
+                // Zoom about the pointer so the point under the cursor stays put.
+                if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                    let anchor = p - canvas_center - view.offset;
+                    view.offset -= anchor * (new_zoom / view.zoom - 1.0);
+                }
+                view.zoom = new_zoom;
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(view_id, view));
+
+        // Effective pixels-per-metre after pan/zoom.
+        let ppm = fit_scale * view.zoom;
+
         let to_screen = |e: f64, n: f64| -> egui::Pos2 {
+            let bx = canvas_center.x + (e as f32 - center_e) * fit_scale;
+            let by = canvas_center.y - (n as f32 - center_n) * fit_scale;
             egui::pos2(
-                canvas_center.x + (e as f32 - center_e) * scale,
-                canvas_center.y - (n as f32 - center_n) * scale,
+                canvas_center.x + view.offset.x + (bx - canvas_center.x) * view.zoom,
+                canvas_center.y + view.offset.y + (by - canvas_center.y) * view.zoom,
             )
         };
 
-        // Subtle grid
-        let grid_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
-        for i in -6..=6i32 {
-            let x = canvas_center.x + i as f32 * draw_rect.width() / 12.0;
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, grid_color),
-            );
-            let y = canvas_center.y + i as f32 * draw_rect.height() / 12.0;
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(1.0, grid_color),
-            );
-        }
-
         // Legs
         let leg_color = egui::Color32::from_rgb(94, 179, 255);
+        let label_color = egui::Color32::from_rgb(165, 185, 215);
         for i in 0..pts.len() - 1 {
             let p1 = to_screen(pts[i][0], pts[i][1]);
             let p2 = to_screen(pts[i + 1][0], pts[i + 1][1]);
@@ -381,16 +441,29 @@ fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
             let mid = egui::pos2((p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0);
             arrow_tip(&painter, p1, mid, leg_color);
 
-            // Leg number label, offset perpendicular to the leg
-            if p1.distance(p2) > 28.0 {
+            // Leg label, offset perpendicular to the leg. Show bearing + distance
+            // when there's room, otherwise just the leg number.
+            let seg_len = p1.distance(p2);
+            if seg_len > 28.0 {
                 let dir = (p2 - p1).normalized();
                 let perp = egui::vec2(-dir.y, dir.x);
+                let (bearing_dms, dist) = legs[i];
+                let text = if seg_len > 64.0 {
+                    format!(
+                        "{}\n{}\n{:.2} m",
+                        i + 1,
+                        dd_to_dms_string(dms_to_dd(bearing_dms)),
+                        dist
+                    )
+                } else {
+                    format!("{}", i + 1)
+                };
                 painter.text(
-                    mid + perp * 15.0,
+                    mid + perp * 18.0,
                     egui::Align2::CENTER_CENTER,
-                    format!("{}", i + 1),
+                    text,
                     egui::FontId::proportional(11.0),
-                    egui::Color32::from_rgb(155, 165, 185),
+                    label_color,
                 );
             }
         }
@@ -460,6 +533,68 @@ fn draw_traverse_diagram(ui: &mut egui::Ui, legs: &[(f64, f64)]) {
             egui::FontId::proportional(11.0),
             ni_color,
         );
+
+        // Misclose magnitude callout — top-left (the red vector is often sub-pixel).
+        let last = pts.last().unwrap();
+        let mc_dist = (last[0] * last[0] + last[1] * last[1]).sqrt();
+        let (mc_text, mc_text_color) = if mc_dist < 1e-6 {
+            (
+                "Misclose  0 (perfect)".to_string(),
+                egui::Color32::from_rgb(70, 210, 105),
+            )
+        } else {
+            (
+                format!("Misclose  {:.3} m", mc_dist),
+                egui::Color32::from_rgb(255, 110, 90),
+            )
+        };
+        painter.text(
+            egui::pos2(rect.left() + 14.0, rect.top() + 14.0),
+            egui::Align2::LEFT_TOP,
+            mc_text,
+            egui::FontId::proportional(12.0),
+            mc_text_color,
+        );
+
+        // Scale bar — bottom-left, a "nice" 1/2/5 length near 110 px.
+        if ppm.is_finite() && ppm > 0.0 {
+            let bar_m = nice_round(110.0 / ppm as f64);
+            let bar_px = (bar_m * ppm as f64) as f32;
+            let x0 = rect.left() + 16.0;
+            let y = rect.bottom() - 22.0;
+            let bar_color = egui::Color32::from_gray(170);
+            painter.line_segment(
+                [egui::pos2(x0, y), egui::pos2(x0 + bar_px, y)],
+                egui::Stroke::new(2.0, bar_color),
+            );
+            for tx in [x0, x0 + bar_px] {
+                painter.line_segment(
+                    [egui::pos2(tx, y - 4.0), egui::pos2(tx, y + 4.0)],
+                    egui::Stroke::new(2.0, bar_color),
+                );
+            }
+            let bar_label = if bar_m >= 1.0 {
+                format!("{:.0} m", bar_m)
+            } else {
+                format!("{} m", bar_m)
+            };
+            painter.text(
+                egui::pos2(x0 + bar_px / 2.0, y - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                bar_label,
+                egui::FontId::proportional(11.0),
+                bar_color,
+            );
+        }
+
+        // Interaction hint — bottom-right.
+        painter.text(
+            egui::pos2(rect.right() - 12.0, rect.bottom() - 10.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "drag · scroll · double-click to reset",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_gray(95),
+        );
     });
 }
 
@@ -510,6 +645,21 @@ impl Default for Settings {
     }
 }
 
+/// Cached result of the misclose pipeline. The big-float trig in
+/// [`calculate_misclose`]/[`detect_blunders`] is far too costly to redo on every
+/// repaint (e.g. while the window is being resized), so it is recomputed on a
+/// timer and reused on intervening frames.
+#[derive(Default)]
+struct ComputeCache {
+    computed_at: Option<std::time::Instant>,
+    valid_legs: Vec<(f64, f64)>,
+    valid_leg_orig_idx: Vec<usize>,
+    misclose: Option<crate::calc::MiscloseResult>,
+    deflection: Option<crate::calc::DeflectionCheck>,
+    blunder_candidates: Vec<BlunderCandidate>,
+    suspect_orig_indices: HashSet<usize>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct NullfieldCalcApp {
     legs: Vec<Leg>,
@@ -525,6 +675,8 @@ pub struct NullfieldCalcApp {
     settings: Settings,
     #[serde(skip)]
     show_settings: bool,
+    #[serde(skip)]
+    cache: ComputeCache,
 }
 
 impl Default for NullfieldCalcApp {
@@ -540,6 +692,7 @@ impl Default for NullfieldCalcApp {
             threshold_str: "10000".to_string(),
             settings: Settings::default(),
             show_settings: false,
+            cache: ComputeCache::default(),
         }
     }
 }
@@ -602,26 +755,58 @@ impl eframe::App for NullfieldCalcApp {
             });
         self.show_settings = show_settings;
 
-        let (valid_legs, valid_leg_orig_idx): (Vec<(f64, f64)>, Vec<usize>) = self
-            .legs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| l.parse().map(|p| (p, i)))
-            .unzip();
-        let misclose = calculate_misclose(&valid_legs);
-        let deflection = check_deflection_sum(&valid_legs);
-        let blunder_candidates: Vec<BlunderCandidate> = match &misclose {
-            Some(m)
-                if valid_legs.len() >= 4 && !m.ratio.is_infinite() && m.ratio < self.threshold =>
-            {
-                detect_blunders(&valid_legs, m.ratio)
+        // The misclose pipeline uses 256-bit big-float trig, which is too costly
+        // to run on every repaint (a window resize alone can drive 60+ fps). Cap
+        // it to RECOMPUTE_INTERVAL and reuse the previous result in between.
+        const RECOMPUTE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        let now = std::time::Instant::now();
+        match self.cache.computed_at {
+            Some(t) if now.duration_since(t) < RECOMPUTE_INTERVAL => {
+                // Still fresh — make sure a repaint lands once it goes stale so
+                // edits made during the interval show up promptly.
+                ctx.request_repaint_after(RECOMPUTE_INTERVAL - now.duration_since(t));
             }
-            _ => vec![],
-        };
-        let suspect_orig_indices: HashSet<usize> = blunder_candidates
-            .iter()
-            .map(|c| valid_leg_orig_idx[c.leg_index])
-            .collect();
+            _ => {
+                let (valid_legs, valid_leg_orig_idx): (Vec<(f64, f64)>, Vec<usize>) = self
+                    .legs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, l)| l.parse().map(|p| (p, i)))
+                    .unzip();
+                let misclose = calculate_misclose(&valid_legs);
+                let deflection = check_deflection_sum(&valid_legs);
+                let blunder_candidates: Vec<BlunderCandidate> = match &misclose {
+                    Some(m)
+                        if valid_legs.len() >= 4
+                            && !m.ratio.is_infinite()
+                            && m.ratio < self.threshold =>
+                    {
+                        detect_blunders(&valid_legs, m.ratio)
+                    }
+                    _ => vec![],
+                };
+                let suspect_orig_indices: HashSet<usize> = blunder_candidates
+                    .iter()
+                    .map(|c| valid_leg_orig_idx[c.leg_index])
+                    .collect();
+                self.cache = ComputeCache {
+                    computed_at: Some(now),
+                    valid_legs,
+                    valid_leg_orig_idx,
+                    misclose,
+                    deflection,
+                    blunder_candidates,
+                    suspect_orig_indices,
+                };
+            }
+        }
+
+        let valid_legs = self.cache.valid_legs.clone();
+        let valid_leg_orig_idx = self.cache.valid_leg_orig_idx.clone();
+        let misclose = self.cache.misclose.clone();
+        let deflection = self.cache.deflection.clone();
+        let blunder_candidates = self.cache.blunder_candidates.clone();
+        let suspect_orig_indices = self.cache.suspect_orig_indices.clone();
 
         let start_e_val = self.start_e.trim().parse::<f64>().ok();
         let start_n_val = self.start_n.trim().parse::<f64>().ok();
@@ -912,45 +1097,46 @@ impl eframe::App for NullfieldCalcApp {
             });
             ui.add_space(6.0);
 
-            // Starting coordinate + scale factor — uses same grid geometry as legs_grid
-            egui::Grid::new("start_row")
-                .num_columns(if has_coords { 5 } else { 4 })
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Start").strong());
+            // Shared column geometry for the start row and the legs table, so the
+            // Easting lines up under the Bearing column and Northing under Distance.
+            const NUM_W: f32 = 34.0;
+            const BEARING_W: f32 = 120.0;
+            const DIST_W: f32 = 104.0;
+            const COORD_W: f32 = 130.0;
+            const COL_GAP: f32 = 10.0;
+            // Nudge frameless cells (labels, coordinates) down so their text lines
+            // up with the text inside the framed inputs.
+            const INPUT_TOP_PAD: f32 = 4.0;
+            // Tighter than the default `symmetric(4, 2)` to keep the boxes short.
+            let input_margin = egui::Margin::symmetric(4, 1);
 
+            // Starting coordinate; the scale factor (CSF) sits under the Easting.
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = COL_GAP;
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(NUM_W, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.add_space(INPUT_TOP_PAD);
+                        ui.strong("Start");
+                    },
+                );
+
+                // Easting, with the scale factor directly below it.
+                ui.vertical(|ui| {
                     let se_ok = self.start_e.trim().is_empty()
                         || self.start_e.trim().parse::<f64>().is_ok();
-                    ui.vertical(|ui| {
-                        ui.scope(|ui| {
-                            if !se_ok {
-                                ui.visuals_mut().extreme_bg_color = error_bg(ui);
-                            }
-                            ui.add_sized(
-                                eframe::egui::Vec2::new(110.0, 10.0),
-                                egui::TextEdit::singleline(&mut self.start_e)
-                                    .desired_width(250.0)
-                                    .hint_text("Easting"),
-                            );
-                        });
-                        ui.label(egui::RichText::new("").size(11.0).monospace());
-                    });
-
-                    let sn_ok = self.start_n.trim().is_empty()
-                        || self.start_n.trim().parse::<f64>().is_ok();
-                    ui.vertical(|ui| {
-                        ui.scope(|ui| {
-                            if !sn_ok {
-                                ui.visuals_mut().extreme_bg_color = error_bg(ui);
-                            }
-                            ui.add_sized(
-                                eframe::egui::Vec2::new(110.0, 10.0),
-                                egui::TextEdit::singleline(&mut self.start_n)
-                                    .desired_width(250.0)
-                                    .hint_text("Northing"),
-                            );
-                        });
-                        ui.label(egui::RichText::new("").size(11.0).monospace());
+                    ui.scope(|ui| {
+                        if !se_ok {
+                            ui.visuals_mut().extreme_bg_color = error_bg(ui);
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.start_e)
+                                .desired_width(BEARING_W)
+                                .margin(input_margin)
+                                .hint_text("Easting"),
+                        );
                     });
 
                     let sf_ok = self.scale_factor.trim().is_empty()
@@ -960,26 +1146,36 @@ impl eframe::App for NullfieldCalcApp {
                             .parse::<f64>()
                             .map(|v| v > 0.0)
                             .unwrap_or(false);
-                    ui.vertical(|ui| {
-                        ui.scope(|ui| {
-                            if !sf_ok {
-                                ui.visuals_mut().extreme_bg_color = error_bg(ui);
-                            }
-                            ui.add_sized(
-                                eframe::egui::Vec2::new(110.0, 10.0),
-                                egui::TextEdit::singleline(&mut self.scale_factor)
-                                    .desired_width(120.0)
-                                    .hint_text("Scale 1.000000"),
-                            );
-                        });
-                        ui.label(egui::RichText::new("").size(11.0).monospace());
+                    ui.scope(|ui| {
+                        if !sf_ok {
+                            ui.visuals_mut().extreme_bg_color = error_bg(ui);
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.scale_factor)
+                                .desired_width(BEARING_W)
+                                .margin(input_margin)
+                                .hint_text("Scale 1.000000"),
+                        );
                     });
-
-                    if has_coords {
-                        ui.label(""); // placeholder for × column
-                    }
-                    ui.end_row();
                 });
+
+                // Northing
+                ui.vertical(|ui| {
+                    let sn_ok = self.start_n.trim().is_empty()
+                        || self.start_n.trim().parse::<f64>().is_ok();
+                    ui.scope(|ui| {
+                        if !sn_ok {
+                            ui.visuals_mut().extreme_bg_color = error_bg(ui);
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.start_n)
+                                .desired_width(DIST_W)
+                                .margin(input_margin)
+                                .hint_text("Northing"),
+                        );
+                    });
+                });
+            });
             ui.add_space(4.0);
 
             let mut to_remove: Option<usize> = None;
@@ -988,33 +1184,71 @@ impl eframe::App for NullfieldCalcApp {
             let mut add_leg = false;
             let num_legs = self.legs.len();
 
+            // Rows use `horizontal_top` (not a Grid) so single-line cells top-align
+            // with the text inputs instead of being vertically centered against the
+            // taller input + hint cells. Column widths/margins are the shared values
+            // declared above the start row, so header, start, and legs all line up.
             egui::ScrollArea::vertical()
                 .max_height(ui.available_height() - 40.0)
                 .show(ui, |ui| {
-                    egui::Grid::new("legs_grid")
-                        .num_columns(if has_coords { 5 } else { 4 })
-                        .spacing([10.0, 2.0])
-                        .striped(false)
-                        .show(ui, |ui| {
-                            // Header row (row 0 — unstriped by egui's alternating scheme)
-                            ui.strong("#");
-                            ui.strong("Bearing  (* reverses)");
-                            ui.strong("Distance  (m/ft/ch/lk)");
-                            if has_coords {
-                                ui.strong("Coordinate (E / N)");
-                            }
-                            ui.label("");
-                            ui.end_row();
+                    // Header row
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = COL_GAP;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(NUM_W, 0.0),
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                ui.strong("#");
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(BEARING_W, 0.0),
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                ui.strong("Bearing  (* reverses)");
+                            },
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(DIST_W, 0.0),
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |ui| {
+                                ui.strong("Distance  (m/ft/ch/lk)");
+                            },
+                        );
+                        if has_coords {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(COORD_W, 0.0),
+                                egui::Layout::left_to_right(egui::Align::Min),
+                                |ui| {
+                                    ui.strong("Coordinate (E / N)");
+                                },
+                            );
+                        }
+                    });
+                    ui.add_space(2.0);
 
-                            for i in 0..num_legs {
-                                let bearing_id = egui::Id::new(("bearing", i));
-                                let distance_id = egui::Id::new(("distance", i));
+                    for i in 0..num_legs {
+                        let bearing_id = egui::Id::new(("bearing", i));
+                        let distance_id = egui::Id::new(("distance", i));
+                        let b_valid = self.legs[i].bearing_valid();
+                        let d_valid = self.legs[i].distance_valid();
+                        let is_suspect = suspect_orig_indices.contains(&i);
 
-                                ui.label(egui::RichText::new(format!("{:2}.", i + 1)).monospace());
+                        let (b_resp, d_resp) = ui
+                            .horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = COL_GAP;
+
+                                // Leg number
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(NUM_W, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.add_space(INPUT_TOP_PAD);
+                                        ui.monospace(format!("{:2}.", i + 1));
+                                    },
+                                );
 
                                 // Bearing cell: input above, DMS hint below (always rendered)
-                                let b_valid = self.legs[i].bearing_valid();
-                                let is_suspect = suspect_orig_indices.contains(&i);
                                 let b_resp = ui
                                     .vertical(|ui| {
                                         let resp = ui
@@ -1031,7 +1265,8 @@ impl eframe::App for NullfieldCalcApp {
                                                         &mut self.legs[i].bearing,
                                                     )
                                                     .id(bearing_id)
-                                                    .desired_width(180.0)
+                                                    .desired_width(BEARING_W)
+                                                    .margin(input_margin)
                                                     .hint_text("e.g. 298.0347 or 118.0347*"),
                                                 )
                                             })
@@ -1055,14 +1290,7 @@ impl eframe::App for NullfieldCalcApp {
                                     })
                                     .inner;
 
-                                if b_resp.lost_focus()
-                                    && ctx.input(|inp| inp.key_pressed(egui::Key::Enter))
-                                {
-                                    next_focus = Some(distance_id);
-                                }
-
-                                // Distance cell: input above, evaluated-metres hint below (always rendered)
-                                let d_valid = self.legs[i].distance_valid();
+                                // Distance cell: input above, evaluated-metres hint below
                                 let d_resp = ui
                                     .vertical(|ui| {
                                         let resp = ui
@@ -1079,7 +1307,8 @@ impl eframe::App for NullfieldCalcApp {
                                                         &mut self.legs[i].distance,
                                                     )
                                                     .id(distance_id)
-                                                    .desired_width(150.0)
+                                                    .desired_width(DIST_W)
+                                                    .margin(input_margin)
                                                     .hint_text("e.g. 100 or 328.084 ft"),
                                                 )
                                             })
@@ -1094,23 +1323,17 @@ impl eframe::App for NullfieldCalcApp {
                                     })
                                     .inner;
 
-                                if d_resp.lost_focus()
-                                    && ctx.input(|inp| inp.key_pressed(egui::Key::Enter))
-                                {
-                                    if i + 1 < num_legs {
-                                        next_focus = Some(egui::Id::new(("bearing", i + 1)));
-                                    } else {
-                                        add_leg = true;
-                                        next_focus = Some(egui::Id::new(("bearing", num_legs)));
-                                    }
-                                }
-
                                 if has_coords {
-                                    match leg_coords.get(i).and_then(|c| *c) {
-                                        Some((e, n)) => {
-                                            let coord_color =
-                                                egui::Color32::from_rgb(140, 200, 140);
-                                            ui.vertical(|ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(COORD_W, 0.0),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            ui.add_space(INPUT_TOP_PAD);
+                                            if let Some((e, n)) =
+                                                leg_coords.get(i).and_then(|c| *c)
+                                            {
+                                                let coord_color =
+                                                    egui::Color32::from_rgb(140, 200, 140);
                                                 ui.label(
                                                     egui::RichText::new(format!(
                                                         "E {:.*}",
@@ -1129,67 +1352,49 @@ impl eframe::App for NullfieldCalcApp {
                                                     .size(11.0)
                                                     .color(coord_color),
                                                 );
-                                            });
-                                        }
-                                        None => {
-                                            ui.label("");
-                                        }
-                                    }
+                                            }
+                                        },
+                                    );
                                 }
 
-                                if num_legs > 1 && ui.small_button("×").clicked() {
-                                    to_remove = Some(i);
-                                }
-                                ui.end_row();
-
-                                if i + 1 < num_legs {
-                                    const SEP_H: f32 = 4.0;
-                                    let num_cols = if has_coords { 5 } else { 4 };
-                                    let mut rects: Vec<egui::Rect> = Vec::with_capacity(num_cols);
-                                    let mut sep_hovered = false;
-                                    let mut sep_clicked = false;
-                                    for _ in 0..num_cols {
-                                        let r = ui.allocate_response(
-                                            egui::vec2(ui.available_width(), SEP_H),
-                                            egui::Sense::click(),
-                                        );
-                                        sep_hovered |= r.hovered();
-                                        sep_clicked |= r.clicked();
-                                        rects.push(r.rect);
+                                ui.menu_button("···", |ui| {
+                                    if ui.button("Add above").clicked() {
+                                        to_insert = Some(i);
+                                        ui.close();
                                     }
-                                    if sep_hovered {
-                                        let x_min = rects.first().unwrap().left();
-                                        let x_max = rects.last().unwrap().right();
-                                        let y = rects[0].center().y;
-                                        let painter = ui.painter();
-                                        painter.line_segment(
-                                            [egui::pos2(x_min, y), egui::pos2(x_max, y)],
-                                            egui::Stroke::new(
-                                                1.5,
-                                                egui::Color32::from_rgb(80, 150, 255),
-                                            ),
-                                        );
-                                        let cx = rects.last().unwrap().center().x;
-                                        painter.circle_filled(
-                                            egui::pos2(cx, y),
-                                            7.0,
-                                            egui::Color32::from_rgb(60, 120, 220),
-                                        );
-                                        painter.text(
-                                            egui::pos2(cx, y),
-                                            egui::Align2::CENTER_CENTER,
-                                            "+",
-                                            egui::FontId::proportional(12.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-                                    if sep_clicked {
+                                    if ui.button("Add below").clicked() {
                                         to_insert = Some(i + 1);
+                                        ui.close();
                                     }
-                                    ui.end_row();
-                                }
+                                    if ui
+                                        .add_enabled(num_legs > 1, egui::Button::new("Delete"))
+                                        .clicked()
+                                    {
+                                        to_remove = Some(i);
+                                        ui.close();
+                                    }
+                                });
+
+                                (b_resp, d_resp)
+                            })
+                            .inner;
+
+                        if b_resp.lost_focus()
+                            && ctx.input(|inp| inp.key_pressed(egui::Key::Enter))
+                        {
+                            next_focus = Some(distance_id);
+                        }
+                        if d_resp.lost_focus()
+                            && ctx.input(|inp| inp.key_pressed(egui::Key::Enter))
+                        {
+                            if i + 1 < num_legs {
+                                next_focus = Some(egui::Id::new(("bearing", i + 1)));
+                            } else {
+                                add_leg = true;
+                                next_focus = Some(egui::Id::new(("bearing", num_legs)));
                             }
-                        });
+                        }
+                    }
                 });
 
             if let Some(i) = to_remove {
